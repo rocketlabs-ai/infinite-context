@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.backup-*
+*.compact.jsonl
+*.egg-info/
+dist/
+build/
+.env
+.venv/
