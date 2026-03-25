@@ -8,6 +8,7 @@ Format matches Claude Code's native /compact output exactly.
 Usage:
     python smart-compact.py [session_file] [options]
     python smart-compact.py --dry-run --keep-recent 500
+    python smart-compact.py --auto-summarize --keep-recent 500
 
 See README.md for full documentation.
 """
@@ -207,6 +208,164 @@ def extract_conversation_text(lines: list[tuple[str, dict | None]],
             turns.append(f"{role.upper()}: {text}")
 
     return turns
+
+
+# ---------------------------------------------------------------------------
+# Auto-summarize via LLM (Ollama local or OpenAI-compatible API)
+# ---------------------------------------------------------------------------
+
+SUMMARY_PROMPT = """\
+You are a conversation summarizer. Read the conversation below and produce \
+a chronological summary that preserves the flow, decisions, and relationship \
+dynamics between the participants.
+
+Requirements:
+- Maintain chronological order
+- Preserve who said what and when decisions were made
+- Keep relationship dynamics, tone shifts, and trust building
+- Preserve key decisions, technical choices, and project milestones
+- Remove tool execution details but keep references to what tools accomplished
+- Keep all names, project names, and specific technical terms
+- Aim for roughly 10-15% of the original length
+- Use a narrative style with clear topic/time markers where identifiable
+- Do NOT editorialize — faithfully compress what happened
+
+Structure:
+1. Brief overview (2-3 sentences)
+2. Chronological narrative organized by topic arcs
+3. Key decisions and their rationale
+4. Open threads at the end
+
+Conversation:
+"""
+
+
+def auto_summarize(conversation_text: str,
+                   model: str = "qwen3:8b",
+                   base_url: str = "http://localhost:11434/v1",
+                   api_key: str | None = None) -> str:
+    """Generate a narrative summary via an OpenAI-compatible API.
+
+    Default: Ollama running locally (free, no API key).
+    Set --base-url and --api-key for any OpenAI-compatible endpoint
+    (Anthropic, OpenRouter, Together, etc).
+    """
+    import urllib.request
+    import urllib.error
+
+    api_url = base_url.rstrip("/")
+    chat_url = f"{api_url}/chat/completions"
+
+    # Chunk if conversation is too large for the model context
+    # Most local models: 8K-128K context. Be conservative.
+    max_input_chars = 120_000  # ~30K tokens, safe for most models
+    chunks = []
+    if len(conversation_text) > max_input_chars:
+        turns = conversation_text.split("\n\n---\n\n")
+        current_chunk = []
+        current_size = 0
+        for turn in turns:
+            turn_size = len(turn) + 7
+            if current_size + turn_size > max_input_chars and current_chunk:
+                chunks.append("\n\n---\n\n".join(current_chunk))
+                current_chunk = [turn]
+                current_size = turn_size
+            else:
+                current_chunk.append(turn)
+                current_size += turn_size
+        if current_chunk:
+            chunks.append("\n\n---\n\n".join(current_chunk))
+    else:
+        chunks = [conversation_text]
+
+    print(f"Summarizing with {model} via {api_url} "
+          f"({len(chunks)} chunk{'s' if len(chunks) > 1 else ''})...")
+
+    summaries = []
+    for i, chunk in enumerate(chunks):
+        if len(chunks) > 1:
+            print(f"  Chunk {i + 1}/{len(chunks)} "
+                  f"(~{len(chunk) // 4:,} tokens)...")
+
+        payload = json.dumps({
+            "model": model,
+            "messages": [
+                {"role": "user", "content": SUMMARY_PROMPT + chunk}
+            ],
+            "stream": False,
+        }).encode("utf-8")
+
+        headers = {"Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
+        req = urllib.request.Request(
+            chat_url,
+            data=payload,
+            headers=headers,
+            method="POST",
+        )
+
+        try:
+            with urllib.request.urlopen(req, timeout=600) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")[:500]
+            print(f"API error ({e.code}): {body}", file=sys.stderr)
+            sys.exit(1)
+        except urllib.error.URLError as e:
+            print(f"Error connecting to {api_url}: {e}", file=sys.stderr)
+            if not api_key and "localhost" in api_url:
+                print("Make sure Ollama is running: ollama serve",
+                      file=sys.stderr)
+            sys.exit(1)
+
+        summary = data["choices"][0]["message"]["content"]
+        summaries.append(summary)
+
+        usage = data.get("usage", {})
+        tokens_in = usage.get("prompt_tokens", "?")
+        tokens_out = usage.get("completion_tokens", "?")
+        print(f"  {'Done' if len(chunks) == 1 else f'Chunk {i + 1} done'}: "
+              f"{tokens_in} in / {tokens_out} out")
+
+    if len(summaries) == 1:
+        return summaries[0]
+
+    # Merge pass for multiple chunks
+    print("  Merging chunk summaries...")
+    merge_prompt = (
+        "Merge these chronological summaries into one cohesive narrative. "
+        "Maintain chronological order, remove redundancy, preserve all key "
+        "decisions and open threads.\n\n"
+        + "\n\n---\n\n".join(summaries)
+    )
+
+    payload = json.dumps({
+        "model": model,
+        "messages": [{"role": "user", "content": merge_prompt}],
+        "stream": False,
+    }).encode("utf-8")
+
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    req = urllib.request.Request(
+        chat_url,
+        data=payload,
+        headers=headers,
+        method="POST",
+    )
+
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    merged = data["choices"][0]["message"]["content"]
+    usage = data.get("usage", {})
+    print(f"  Merge done: {usage.get('prompt_tokens', '?')} in / "
+          f"{usage.get('completion_tokens', '?')} out")
+    return merged
 
 
 # ---------------------------------------------------------------------------
@@ -498,7 +657,10 @@ def estimate_tokens(lines: list[tuple[str, dict | None]]) -> int:
 def smart_compact(session_path: Path, threshold: int, keep_recent: int,
                   prune_thinking: bool, dry_run: bool, no_backup: bool,
                   summary_path: Path | None,
-                  extract_conversation: Path | None) -> None:
+                  extract_conversation: Path | None,
+                  auto_summarize_model: str | None = None,
+                  auto_summarize_base_url: str = "http://localhost:11434/v1",
+                  auto_summarize_api_key: str | None = None) -> None:
     """Main compact logic."""
 
     if not session_path.exists():
@@ -566,6 +728,26 @@ def smart_compact(session_path: Path, threshold: int, keep_recent: int,
         print("\nGenerate a summary from this file, then re-run with "
               "--summary-file <path>")
         return
+
+    # Auto-summarize: extract conversation, call API, use result as summary
+    if auto_summarize_model and summary_path is None:
+        turns = extract_conversation_text(work_lines, split_idx)
+        if turns:
+            conversation_text = "\n\n---\n\n".join(turns)
+            print(f"Extracted {len(turns)} turns for summarization "
+                  f"(~{len(conversation_text) // 4:,} tokens)")
+            generated_summary = auto_summarize(
+                conversation_text,
+                model=auto_summarize_model,
+                base_url=auto_summarize_base_url,
+                api_key=auto_summarize_api_key,
+            )
+            summary_path = session_path.with_suffix(".summary.md")
+            summary_path.write_text(generated_summary, encoding="utf-8")
+            print(f"Summary written to: {summary_path} "
+                  f"({format_size(summary_path.stat().st_size)})")
+        else:
+            print("No conversation text found for summarization.")
 
     # Extract metadata
     meta = extract_session_metadata(all_lines)
@@ -879,7 +1061,16 @@ Examples:
   # Compact with custom narrative summary
   %(prog)s --keep-recent 500 --summary-file my-summary.md
 
-  # Full pipeline: extract → summarize → compact
+  # Auto-summarize via Ollama (local, free)
+  %(prog)s --auto-summarize --keep-recent 500
+
+  # Auto-summarize with a specific model
+  %(prog)s --auto-summarize --model llama3.1:8b -k 500
+
+  # Auto-summarize via remote API (OpenRouter, Anthropic, etc)
+  %(prog)s --auto-summarize --base-url https://openrouter.ai/api/v1 --api-key sk-... --model anthropic/claude-haiku -k 500
+
+  # Manual pipeline: extract -> summarize -> compact
   %(prog)s --extract-conversation conv.txt -k 500
   # (generate summary from conv.txt using your preferred method)
   %(prog)s -k 500 --summary-file summary.md
@@ -919,6 +1110,26 @@ Examples:
         "--no-backup", action="store_true",
         help="Skip creating a backup before overwriting.",
     )
+    parser.add_argument(
+        "--auto-summarize", action="store_true",
+        help="Generate narrative summary via LLM API. "
+             "Default: Ollama locally. Use --base-url and --api-key "
+             "for remote APIs.",
+    )
+    parser.add_argument(
+        "--model", type=str, default="qwen3:8b",
+        help="Model for --auto-summarize (default: qwen3:8b via Ollama).",
+    )
+    parser.add_argument(
+        "--base-url", type=str, default="http://localhost:11434/v1",
+        help="OpenAI-compatible API base URL "
+             "(default: http://localhost:11434/v1 for Ollama).",
+    )
+    parser.add_argument(
+        "--api-key", type=str, default=None,
+        help="API key for remote endpoints. "
+             "Also reads from SMART_COMPACT_API_KEY env var.",
+    )
 
     args = parser.parse_args()
 
@@ -937,6 +1148,13 @@ Examples:
         if args.extract_conversation
         else None
     )
+    auto_model = args.model if args.auto_summarize else None
+    api_key = args.api_key or os.environ.get("SMART_COMPACT_API_KEY")
+
+    if args.auto_summarize and args.summary_file:
+        print("Error: --auto-summarize and --summary-file are mutually "
+              "exclusive.", file=sys.stderr)
+        sys.exit(1)
 
     smart_compact(
         session_path=session_path,
@@ -947,6 +1165,9 @@ Examples:
         no_backup=args.no_backup,
         summary_path=summary_path,
         extract_conversation=extract_path,
+        auto_summarize_model=auto_model,
+        auto_summarize_base_url=args.base_url,
+        auto_summarize_api_key=api_key,
     )
 
 

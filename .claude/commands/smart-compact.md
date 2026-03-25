@@ -1,21 +1,38 @@
 Run Smart Compact to extend this session beyond the context window.
 
-Smart Compact inserts a compaction boundary matching Claude Code's native format, with a narrative summary of earlier conversation and preserved recent messages.
+Smart Compact inserts a compaction boundary matching Claude Code's native format, with a narrative summary of earlier conversation and preserved recent messages. This command orchestrates the full pipeline without external dependencies.
 
-1. Find the current session's JSONL file. Session files are at `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`. Use the most recently modified `.jsonl` in that directory.
-2. Run dry-run first: `python3 smart-compact.py <path> --dry-run --keep-recent 500`
-3. If the dry run looks good and integrity checks pass, run without `--dry-run` to compact in place (backup is created automatically).
-4. Report the results: messages summarized/preserved, discovered tools, file size, estimated tokens on resume, integrity check results.
-5. Remind the user to `/clear` and `claude --resume <session_id>` to reload the compacted session.
+Follow these steps:
 
-For best results, generate a narrative summary first:
-1. `python3 smart-compact.py <path> --extract-conversation conversation.txt -k 500`
-2. Summarize the extracted text (use Claude, edit manually, etc.)
-3. `python3 smart-compact.py <path> -k 500 --summary-file summary.md`
+1. Find the current session's JSONL file. Session files are at `~/.claude/projects/<encoded-cwd>/<session-id>.jsonl`. Use the most recently modified `.jsonl` in that directory (skip any in `subagents/` subdirectories).
 
-Options:
-- `-k, --keep-recent N` — recent messages to preserve (default: 500)
-- `--summary-file <path>` — narrative summary file
-- `--extract-conversation <path>` — extract conversation text and exit
-- `-t, --threshold N` — byte threshold for slimming tool results (default: 1500)
-- `--prune-thinking` — also slim large thinking blocks
+2. Run the extraction step to get conversation text stripped of tool blocks:
+   ```
+   python3 smart-compact.py <path> --extract-conversation /tmp/sc-conversation.txt --keep-recent 500
+   ```
+
+3. Read the extracted conversation file at `/tmp/sc-conversation.txt`.
+
+4. Write a chronological narrative summary to `/tmp/sc-summary.md`. The summary should:
+   - Maintain chronological order — this is a story that unfolds over time
+   - Preserve who said what, when decisions were made, when direction changed
+   - Keep relationship dynamics, tone shifts, and key agreements
+   - Preserve technical decisions, project milestones, and pivots
+   - Remove tool execution details but reference what was accomplished
+   - Keep all names, project names, and specific terms
+   - Be roughly 10-15% of the original conversation length
+   - End with open threads and unresolved items
+
+5. Run the compaction with the narrative summary:
+   ```
+   python3 smart-compact.py <path> --keep-recent 500 --summary-file /tmp/sc-summary.md --dry-run
+   ```
+
+6. If the dry run passes all integrity checks, run without `--dry-run`:
+   ```
+   python3 smart-compact.py <path> --keep-recent 500 --summary-file /tmp/sc-summary.md
+   ```
+
+7. Report the results: messages summarized/preserved, discovered tools, estimated tokens on resume, integrity check results.
+
+8. Tell the user to run `/clear` then `claude --resume <session_id>` to reload the compacted session.

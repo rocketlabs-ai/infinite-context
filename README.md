@@ -21,34 +21,82 @@ git clone https://github.com/rocketlabs-ai/infinite-context.git
 cd infinite-context
 ```
 
-No dependencies beyond Python 3.12+ standard library. The script reads and writes JSONL files directly.
+No dependencies beyond Python 3.12+ standard library. Zero `pip install` required.
+
+For auto-summarization, the script calls any OpenAI-compatible API via stdlib `urllib` — no SDK needed. Works with Ollama (local, free) out of the box, or any remote API with `--base-url` and `--api-key`.
 
 ## Usage
 
-### Quick start — compact your latest session
+### Option A: Slash command (Max/Pro users — no API key needed)
+
+If you're running Claude Code, install the slash command:
 
 ```bash
-# Dry run first (writes to .compact.jsonl, doesn't modify original)
+# Copy into your project
+cp -r .claude/commands/ /path/to/your/project/.claude/commands/
+```
+
+Then in any Claude Code session:
+```
+/project:smart-compact
+```
+
+The slash command orchestrates the full pipeline using the session's own model — no API key required. It extracts the conversation, writes a narrative summary, and compacts.
+
+### Option B: Auto-summarize via Ollama (local, free)
+
+```bash
+# Make sure Ollama is running with a model pulled
+ollama pull qwen3:8b
+ollama serve
+
+# One command — extracts, summarizes, compacts
+python smart-compact.py --auto-summarize --keep-recent 500
+
+# Use a different local model
+python smart-compact.py --auto-summarize --model llama3.1:8b -k 500
+```
+
+Default model: `qwen3:8b`. No API key needed.
+
+### Option C: Auto-summarize via remote API
+
+```bash
+# Any OpenAI-compatible endpoint (OpenRouter, Anthropic, Together, etc)
+python smart-compact.py --auto-summarize \
+  --base-url https://openrouter.ai/api/v1 \
+  --api-key sk-or-... \
+  --model anthropic/claude-haiku -k 500
+
+# Or set the key via environment variable
+export SMART_COMPACT_API_KEY=sk-...
+python smart-compact.py --auto-summarize --base-url https://api.anthropic.com/v1 --model claude-haiku-4-5-20251001 -k 500
+```
+
+### Option D: Manual pipeline (full control)
+
+```bash
+# Step 1: Extract conversation text (strips tool blocks, keeps dialogue)
+python smart-compact.py --extract-conversation conversation.txt -k 500
+
+# Step 2: Summarize conversation.txt using your preferred method
+# (Claude, ChatGPT, manual editing — whatever captures the context)
+
+# Step 3: Compact with the narrative summary
+python smart-compact.py -k 500 --summary-file summary.md
+```
+
+### Option E: Quick compact (no summary)
+
+```bash
+# Dry run first
 python smart-compact.py --dry-run
 
 # Compact in place (creates timestamped backup automatically)
 python smart-compact.py
 ```
 
-### With a narrative summary (recommended)
-
-The best results come from providing a narrative summary of the conversation before the boundary. Two-step workflow:
-
-```bash
-# Step 1: Extract conversation text (strips tool blocks, keeps dialogue)
-python smart-compact.py --extract-conversation conversation.txt --keep-recent 500
-
-# Step 2: Summarize conversation.txt using your preferred method
-# (Claude, ChatGPT, manual editing — whatever captures the context)
-
-# Step 3: Compact with the narrative summary
-python smart-compact.py --keep-recent 500 --summary-file summary.md
-```
+Works without a summary file — uses a generic placeholder. Better than hitting context limits, but options A-D produce better results.
 
 ### Specify a session file
 
@@ -63,6 +111,10 @@ Session files live at `~/.claude/projects/<project-hash>/<session-id>.jsonl`.
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-k, --keep-recent N` | 500 | Number of recent messages to preserve at full fidelity |
+| `--auto-summarize` | off | Generate narrative summary via LLM API |
+| `--model MODEL` | qwen3:8b | Model for `--auto-summarize` |
+| `--base-url URL` | http://localhost:11434/v1 | API endpoint (Ollama default) |
+| `--api-key KEY` | — | API key for remote endpoints |
 | `--summary-file PATH` | — | Path to narrative summary text file |
 | `--extract-conversation PATH` | — | Extract pre-split conversation text and exit |
 | `-t, --threshold N` | 1500 | Byte threshold for slimming tool results |
