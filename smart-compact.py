@@ -604,26 +604,50 @@ def extract_session_metadata(lines: list[tuple[str, dict | None]]) -> dict:
 
 def repair_preserved_chain(preserved_lines: list[tuple[str, dict | None]],
                            anchor_uuid: str) -> dict:
-    """Fix the parentUuid chain so the first preserved message links
-    to the summary message.
+    """Fix the parentUuid chain for preserved messages.
+
+    The session loader (Vs6 in cli.js) traces from the leaf backward via
+    parentUuid. Any message whose parentUuid points outside the preserved
+    section creates a chain break — the loader stops there and never
+    reaches the summary.
+
+    Discord integration and other async sources create branching chains,
+    so there can be MULTIPLE chain roots in the preserved section, not
+    just the first message. All orphaned parentUuids must be re-linked
+    to the anchor (summary message UUID).
 
     Returns preservedSegment metadata: {headUuid, anchorUuid, tailUuid}.
     """
     head_uuid = None
     tail_uuid = None
 
+    # Build set of all UUIDs in preserved segment
+    preserved_uuids = set()
     for _raw, obj in preserved_lines:
         if obj and obj.get("uuid"):
+            preserved_uuids.add(obj["uuid"])
             if head_uuid is None:
                 head_uuid = obj["uuid"]
             tail_uuid = obj["uuid"]
 
-    # First message links to anchor (summary)
+    # Also include the anchor itself (summary UUID) as a valid target
+    preserved_uuids.add(anchor_uuid)
+
+    # Repair ALL orphaned parentUuids — any message whose parent
+    # points outside the preserved section gets re-linked to anchor
+    repaired = 0
     for i, (raw, obj) in enumerate(preserved_lines):
-        if obj and is_any_message(obj):
+        if obj is None:
+            continue
+        parent = obj.get("parentUuid")
+        if parent and parent not in preserved_uuids:
             obj["parentUuid"] = anchor_uuid
-            preserved_lines[i] = (json.dumps(obj, ensure_ascii=False), obj)
-            break
+            preserved_lines[i] = (json.dumps(obj, ensure_ascii=False,
+                                             separators=(',', ':')), obj)
+            repaired += 1
+
+    if repaired:
+        print(f"Repaired {repaired} orphaned parentUuid link(s) in preserved section")
 
     return {
         "headUuid": head_uuid or anchor_uuid,
@@ -821,7 +845,7 @@ def smart_compact(session_path: Path, threshold: int, keep_recent: int,
                     thinking_pruned += 1
                     modified = True
         if modified:
-            post_split[i] = (json.dumps(obj, ensure_ascii=False), obj)
+            post_split[i] = (json.dumps(obj, ensure_ascii=False, separators=(',', ':')), obj)
 
     # Assemble output
     output_lines = []
@@ -829,8 +853,11 @@ def smart_compact(session_path: Path, threshold: int, keep_recent: int,
         output_lines.append(raw)
     for raw, _obj in pre_split:
         output_lines.append(raw)
-    output_lines.append(json.dumps(boundary, ensure_ascii=False))
-    output_lines.append(json.dumps(summary_msg, ensure_ascii=False))
+    # CRITICAL: Use compact separators (no spaces) so K48 byte scanner
+    # in Claude Code's session loader can match the '{"type":"system"' prefix.
+    # Python's default json.dumps adds spaces after : and , which breaks the scan.
+    output_lines.append(json.dumps(boundary, ensure_ascii=False, separators=(',', ':')))
+    output_lines.append(json.dumps(summary_msg, ensure_ascii=False, separators=(',', ':')))
     for raw, _obj in post_split:
         output_lines.append(raw)
 

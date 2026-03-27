@@ -714,7 +714,7 @@ Valid API `role` values: Only `"user"` and `"assistant"` -- everything else is c
 
 4. **Do NOT write multiple `compact_boundary` entries for one compaction** -- K48 finds the LAST one and discards everything before it. Multiple boundaries would cause data loss.
 
-5. **Do NOT break the parentUuid chain** -- if you're preserving messages after the boundary, ensure their `parentUuid` values point to UUIDs that exist in the post-boundary content. Broken chains cause `Vs6()` to stop early.
+5. **Do NOT break the parentUuid chain** -- if you're preserving messages after the boundary, ensure their `parentUuid` values point to UUIDs that exist in the post-boundary content. Broken chains cause `Vs6()` to stop early. Sessions with Discord MCP, async sources, or parallel tool execution create **branching chains** -- there may be multiple chain roots in the preserved section, not just the first message. ALL orphaned parentUuids must be re-linked to the summary, not just the first one.
 
 6. **Do NOT include `isSidechain: true` on main chain messages** -- `gb8()` explicitly filters these out when finding the conversation leaf. Setting this on a main chain message would orphan it.
 
@@ -724,7 +724,9 @@ Valid API `role` values: Only `"user"` and `"assistant"` -- everything else is c
 
 9. **Do NOT include `normalizedMessages` arrays in progress entries** -- G26 explicitly clears these to save memory. Don't waste bytes writing them.
 
-10. **Do NOT use `"content-replacement"` type unless you understand the L34 pipeline** -- content replacements are applied by `L34()` before messages reach the API. They're tool-result-specific size reduction records, not general message transforms.
+10. **Do NOT serialize JSON with spaces in separators** -- K48's fast prefix check uses `Buffer.from('{"type":"system"')` (no space after colon). Python's `json.dumps` default produces `{"type": "system"` (with space), which K48 never matches. Use `json.dumps(obj, separators=(',', ':'))` for all entries that must be found by K48 (boundary and summary at minimum; compact separators for all re-serialized entries is safest).
+
+11. **Do NOT use `"content-replacement"` type unless you understand the L34 pipeline** -- content replacements are applied by `L34()` before messages reach the API. They're tool-result-specific size reduction records, not general message transforms.
 
 ### Key Constants
 
