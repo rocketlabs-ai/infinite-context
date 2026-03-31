@@ -98,6 +98,8 @@ def main():
     max_chars = 500
     dry_run = False
 
+    summary_file = None
+
     i = 2
     while i < len(sys.argv):
         if sys.argv[i] == "--keep-recent":
@@ -105,6 +107,9 @@ def main():
             i += 2
         elif sys.argv[i] == "--max-chars":
             max_chars = int(sys.argv[i + 1])
+            i += 2
+        elif sys.argv[i] == "--summary-file":
+            summary_file = sys.argv[i + 1]
             i += 2
         elif sys.argv[i] == "--dry-run":
             dry_run = True
@@ -160,36 +165,114 @@ def main():
     # PHASE 1: Compress older conversation messages
     compressed = []
     dropped = 0
-    for idx in conv_indices[:split_conv]:
-        obj = all_entries[idx]
-        msg = obj.get("message", {})
-        role = msg.get("role", obj.get("type", ""))
-        content = msg.get("content", "")
-        text = extract_text(content)
 
-        if not text:
-            dropped += 1
-            continue
+    if summary_file:
+        # Use pre-written summary file instead of auto-compression
+        print(f"Using summary file: {summary_file}")
+        with open(summary_file, "r", encoding="utf-8") as sf:
+            summary_lines = sf.readlines()
 
-        # Skip compaction summaries and meta messages
-        if obj.get("isCompactSummary") or obj.get("isVisibleInTranscriptOnly"):
-            dropped += 1
-            continue
+        # Get timestamp range from original conversation for realistic spread
+        first_ts = None
+        last_compressed_ts = None
+        for idx in conv_indices[:split_conv]:
+            ts = all_entries[idx].get("timestamp")
+            if ts:
+                if not first_ts:
+                    first_ts = ts
+                last_compressed_ts = ts
 
-        # Drop filler
-        if is_filler(text, role):
-            dropped += 1
-            continue
+        current_role = None
+        current_text = []
+        _summary_turns_raw = []
+        for line in summary_lines:
+            stripped = line.strip()
+            if stripped.startswith("USER:"):
+                if current_role and current_text:
+                    _summary_turns_raw.append({
+                        "role": current_role,
+                        "text": "\n".join(current_text).strip(),
+                    })
+                current_role = "user"
+                current_text = [stripped[5:].strip()]
+            elif stripped.startswith("ASSISTANT:"):
+                if current_role and current_text:
+                    _summary_turns_raw.append({
+                        "role": current_role,
+                        "text": "\n".join(current_text).strip(),
+                    })
+                current_role = "assistant"
+                current_text = [stripped[10:].strip()]
+            elif stripped.startswith("#") or stripped.startswith("---") or stripped.startswith("["):
+                if current_role and current_text:
+                    _summary_turns_raw.append({
+                        "role": current_role,
+                        "text": "\n".join(current_text).strip(),
+                    })
+                    current_role = None
+                    current_text = []
+            elif stripped and current_role:
+                current_text.append(stripped)
+        if current_role and current_text:
+            _summary_turns_raw.append({
+                "role": current_role,
+                "text": "\n".join(current_text).strip(),
+            })
 
-        # Compress
-        compressed_text = compress_turn(text, max_chars)
-        compressed.append({
-            "role": role,
-            "text": compressed_text,
-            "timestamp": obj.get("timestamp"),
-        })
+        # Spread timestamps across the original date range
+        from datetime import timedelta
+        try:
+            t_start = datetime.fromisoformat(first_ts.replace("Z", "+00:00"))
+            t_end = datetime.fromisoformat(last_compressed_ts.replace("Z", "+00:00"))
+        except:
+            t_start = datetime.now(timezone.utc) - timedelta(days=17)
+            t_end = datetime.now(timezone.utc) - timedelta(hours=2)
 
-    print(f"Compressed: {len(compressed)} turns kept, {dropped} dropped")
+        n_turns = len(_summary_turns_raw)
+        if n_turns > 1:
+            step = (t_end - t_start) / (n_turns - 1)
+        else:
+            step = timedelta(0)
+
+        for i, turn in enumerate(_summary_turns_raw):
+            ts = (t_start + step * i).isoformat()
+            compressed.append({
+                "role": turn["role"],
+                "text": turn["text"],
+                "timestamp": ts,
+            })
+        print(f"Summary: {len(compressed)} turns parsed from file, timestamps spread {first_ts} to {last_compressed_ts}")
+    else:
+        for idx in conv_indices[:split_conv]:
+            obj = all_entries[idx]
+            msg = obj.get("message", {})
+            role = msg.get("role", obj.get("type", ""))
+            content = msg.get("content", "")
+            text = extract_text(content)
+
+            if not text:
+                dropped += 1
+                continue
+
+            # Skip compaction summaries and meta messages
+            if obj.get("isCompactSummary") or obj.get("isVisibleInTranscriptOnly"):
+                dropped += 1
+                continue
+
+            # Drop filler
+            if is_filler(text, role):
+                dropped += 1
+                continue
+
+            # Compress
+            compressed_text = compress_turn(text, max_chars)
+            compressed.append({
+                "role": role,
+                "text": compressed_text,
+                "timestamp": obj.get("timestamp"),
+            })
+
+        print(f"Compressed: {len(compressed)} turns kept, {dropped} dropped")
 
     # PHASE 2: Collect preserved entries, slim tool results
     preserved = []

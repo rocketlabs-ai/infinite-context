@@ -2,37 +2,102 @@
 
 Claude Code sessions hit context limits. This fixes that.
 
-Smart Compact extends your Claude Code sessions beyond the context window by surgically inserting a compaction boundary — the same mechanism Claude Code uses internally — with a narrative summary of everything before it. Your session resumes with full awareness of what happened, not a blank slate.
+Two approaches. **Session Rebuild is preferred** — it produces a file the model cannot distinguish from a continuous conversation. Smart Compact is the alternative if you need compact_boundary compatibility.
 
-## How it works
+---
 
-Claude Code stores conversations as JSONL files. When a session gets too long, the built-in `/compact` command summarizes everything and draws a line — the session loader only reads messages after that line on resume. Smart Compact does the same thing, but gives you control:
+## Approach A: Session Rebuild (preferred)
 
-1. **Compact boundary** — a marker that tells the session loader "start reading here." Format matches Claude Code's native output exactly (verified against the source).
-2. **Narrative summary** — instead of a generic summary, you provide (or generate) a rich chronological narrative of what happened before the boundary. The model resumes with real context.
-3. **Preserved messages** — the last N conversation messages are kept at full fidelity after the boundary. Tool results above a size threshold are slimmed with descriptive summaries.
+Rebuilds the session JSONL with compressed older turns written as real messages, then preserved recent turns at full fidelity. No `compact_boundary`, no framing text, no detectable seam.
 
-The result: your 28MB session that was hitting context limits now loads ~800K tokens on resume — the narrative summary plus your recent conversation — and the model picks up exactly where you left off.
+**Why it beats compact_boundary:**
+- No "This session is being continued..." framing text
+- No `isCompactSummary: true` flag
+- No grain change between polished summary and raw messages
+- Three blind Opus agents couldn't find the seam — they thought they were reading the uncompacted original
 
-## Installation
+The model sees one continuous conversation from start to finish.
+
+### Best pipeline: Opus-summarized rebuild
+
+1. **Deploy an Opus agent** to read the full JSONL and write a turn-by-turn summary:
+   - Format: alternating `USER:` and `ASSISTANT:` lines
+   - Preserve key decisions, shared shorthand, emotional texture
+   - Compress operational noise (heartbeats, monitoring, repetitive tool calls)
+   - Target: ~15-20K tokens covering all turns before the preserved section
+   - Output to a file, e.g. `session-summary.md`
+
+2. **Dry-run:**
+   ```bash
+   python rebuild-session.py <session.jsonl> --keep-recent 200 --summary-file session-summary.md --dry-run
+   ```
+
+3. **Verify:** Check estimated tokens (~200-250K target), timestamp spread, turn count.
+
+4. **Go live** (backup is automatic):
+   ```bash
+   python rebuild-session.py <session.jsonl> --keep-recent 200 --summary-file session-summary.md
+   ```
+
+5. **Resume:**
+   ```bash
+   claude --resume <session-id>
+   ```
+
+No `/clear` needed. The loader reads the whole file and sees a normal conversation.
+
+### Fallback: auto-compression (no summary agent)
+
+```bash
+# Truncates each old turn to max-chars. Faster but loses texture.
+python rebuild-session.py <session.jsonl> --keep-recent 200 --max-chars 300 --dry-run
+```
+
+### rebuild-session.py options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--keep-recent N` | 396 | Recent conversation messages to preserve at full fidelity |
+| `--max-chars N` | 500 | Max chars per compressed turn (sentence-boundary truncation) |
+| `--summary-file PATH` | — | Pre-written turn-by-turn summary (USER:/ASSISTANT: format) |
+| `--dry-run` | off | Write to `.rebuilt.jsonl` instead of overwriting |
+
+When `--summary-file` is provided, the script spreads timestamps across the original date range automatically — no manual timestamp fixing needed.
+
+### Key parameters
+
+| keep-recent | max-chars | Typical tokens | Good for |
+|-------------|-----------|---------------|----------|
+| 100 | 200 | ~250K | Minimal footprint |
+| 200 | 300 | ~470K | **Recommended.** Rich context within 500K target |
+| 400 | 300 | ~600K | Heavy sessions approaching 1M |
+| 200 | 500 | ~600K | More detail in older turns |
+
+---
+
+## Approach B: Smart Compact
+
+Inserts a `compact_boundary` marker matching Claude Code's native format, with a narrative summary and preserved recent messages. The model knows compaction occurred — framing text is visible — but resumes with full context.
+
+Smart Compact is the right choice if:
+- You want compact_boundary compatibility
+- You're using the `/project:smart-compact` slash command (no API key required)
+- You prefer the simpler single-script pipeline
+
+### Installation
 
 ```bash
 git clone https://github.com/rocketlabs-ai/infinite-context.git
 cd infinite-context
 ```
 
-No dependencies beyond Python 3.12+ standard library. Zero `pip install` required.
+No dependencies beyond Python 3.12+ standard library.
 
-For auto-summarization, the script calls any OpenAI-compatible API via stdlib `urllib` — no SDK needed. Works with Ollama (local, free) out of the box, or any remote API with `--base-url` and `--api-key`.
-
-## Usage
+For auto-summarization, the script calls any OpenAI-compatible API via stdlib `urllib` — no SDK needed. Works with Ollama (local, free) out of the box.
 
 ### Option A: Slash command (Max/Pro users — no API key needed)
 
-If you're running Claude Code, install the slash command:
-
 ```bash
-# Copy into your project
 cp -r .claude/commands/ /path/to/your/project/.claude/commands/
 ```
 
@@ -41,46 +106,33 @@ Then in any Claude Code session:
 /project:smart-compact
 ```
 
-The slash command orchestrates the full pipeline using the session's own model — no API key required. It extracts the conversation, writes a narrative summary, and compacts.
+The slash command orchestrates the full pipeline using the session's own model.
 
 ### Option B: Auto-summarize via Ollama (local, free)
 
 ```bash
-# Make sure Ollama is running with a model pulled
 ollama pull qwen3:8b
 ollama serve
 
-# One command — extracts, summarizes, compacts
 python smart-compact.py --auto-summarize --keep-recent 500
-
-# Use a different local model
-python smart-compact.py --auto-summarize --model llama3.1:8b -k 500
 ```
-
-Default model: `qwen3:8b`. No API key needed.
 
 ### Option C: Auto-summarize via remote API
 
 ```bash
-# Any OpenAI-compatible endpoint (OpenRouter, Anthropic, Together, etc)
 python smart-compact.py --auto-summarize \
   --base-url https://openrouter.ai/api/v1 \
   --api-key sk-or-... \
   --model anthropic/claude-haiku -k 500
-
-# Or set the key via environment variable
-export SMART_COMPACT_API_KEY=sk-...
-python smart-compact.py --auto-summarize --base-url https://api.anthropic.com/v1 --model claude-haiku-4-5-20251001 -k 500
 ```
 
 ### Option D: Manual pipeline (full control)
 
 ```bash
-# Step 1: Extract conversation text (strips tool blocks, keeps dialogue)
+# Step 1: Extract conversation text
 python smart-compact.py --extract-conversation conversation.txt -k 500
 
-# Step 2: Summarize conversation.txt using your preferred method
-# (Claude, ChatGPT, manual editing — whatever captures the context)
+# Step 2: Summarize using your preferred method
 
 # Step 3: Compact with the narrative summary
 python smart-compact.py -k 500 --summary-file summary.md
@@ -89,31 +141,18 @@ python smart-compact.py -k 500 --summary-file summary.md
 ### Option E: Quick compact (no summary)
 
 ```bash
-# Dry run first
 python smart-compact.py --dry-run
-
-# Compact in place (creates timestamped backup automatically)
 python smart-compact.py
 ```
 
-Works without a summary file — uses a generic placeholder. Better than hitting context limits, but options A-D produce better results.
-
-### Specify a session file
-
-```bash
-python smart-compact.py path/to/session.jsonl --dry-run
-```
-
-Session files live at `~/.claude/projects/<project-hash>/<session-id>.jsonl`.
-
-### Options
+### smart-compact.py options
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-k, --keep-recent N` | 500 | Number of recent messages to preserve at full fidelity |
+| `-k, --keep-recent N` | 500 | Recent messages to preserve at full fidelity |
 | `--auto-summarize` | off | Generate narrative summary via LLM API |
 | `--model MODEL` | qwen3:8b | Model for `--auto-summarize` |
-| `--base-url URL` | http://localhost:11434/v1 | API endpoint (Ollama default) |
+| `--base-url URL` | http://localhost:11434/v1 | API endpoint |
 | `--api-key KEY` | — | API key for remote endpoints |
 | `--summary-file PATH` | — | Path to narrative summary text file |
 | `--extract-conversation PATH` | — | Extract pre-split conversation text and exit |
@@ -122,9 +161,7 @@ Session files live at `~/.claude/projects/<project-hash>/<session-id>.jsonl`.
 | `--dry-run` | off | Write to `.compact.jsonl` instead of overwriting |
 | `--no-backup` | off | Skip creating a backup |
 
-### Choosing --keep-recent
-
-The right value depends on your context window and how much room you need:
+### Choosing --keep-recent (Smart Compact)
 
 | keep-recent | Typical tokens on resume | Good for |
 |-------------|------------------------|----------|
@@ -132,6 +169,8 @@ The right value depends on your context window and how much room you need:
 | 200 | ~200K | Light sessions |
 | 500 | ~800K | **Recommended.** Rich context within 1M window |
 | 1000 | ~1.3M | Heavy sessions, may exceed context window |
+
+---
 
 ## How we built it
 
@@ -141,20 +180,7 @@ We reverse-engineered Claude Code's session loader by reading the bundled `cli.j
 2. **Compaction** — what triggers it, the exact JSON format of the boundary marker and summary message, what metadata fields are required.
 3. **JSONL to API** — the 12+ transformation stages between raw JSONL and the messages array sent to Claude, including which fields are harness-only and which reach the API.
 
-Smart Compact produces output that is structurally identical to Claude Code's native `/compact`. The session loader processes it the same way.
-
-## Integrity checks
-
-Every compaction run verifies:
-
-- Compact boundary exists with correct format
-- Summary message follows boundary with plain string content
-- `compactMetadata` has all required fields (trigger, preTokens, preCompactDiscoveredTools, preservedSegment)
-- `logicalParentUuid` links to the last pre-compact message
-- Summary links to boundary via `parentUuid`
-- First preserved message links to summary
-- Tool use/result pairing is intact in preserved section
-- Boundary `parentUuid` matches `logicalParentUuid`
+Both scripts produce output that correctly handles Claude Code's session loading requirements. The K48 byte scanner only activates at files over 5MB — rebuild targets keep files well under that threshold by design.
 
 ## License
 

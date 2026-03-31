@@ -1,12 +1,12 @@
 # Infinite Context — Session Rebuild Protocol
 
-The winning approach for extending Claude Code sessions beyond the context window. Produces a session file indistinguishable from a continuous conversation — no compaction markers, no framing text, no detectable seam.
+The preferred approach for extending Claude Code sessions beyond the context window. Produces a session file indistinguishable from a continuous conversation — no compaction markers, no framing text, no detectable seam.
 
 ## How It Works
 
 Instead of inserting a `compact_boundary` + summary message (which the model can detect), rebuild the entire session file:
 
-1. **Compress older turns** — truncate at sentence boundaries, drop filler, keep voice and texture
+1. **Compress older turns** — replace with a pre-written turn-by-turn summary, or truncate at sentence boundaries
 2. **Preserve recent turns** — full fidelity, slimmed tool results
 3. **Write as real JSONL messages** — compressed turns look like normal conversation entries
 4. **Linearize the chain** — every entry's parentUuid points to the previous entry
@@ -22,35 +22,93 @@ The `compact_boundary` approach has unavoidable tells:
 - Grain change between polished summary and raw preserved messages
 - The model knows compaction occurred
 
-The rebuild approach has none of these. Compressed turns are real messages with real UUIDs, timestamps, and content. The only difference is shorter content in older turns — which the model interprets as normal conversation density variation.
+The rebuild approach has none of these. Compressed turns are real messages with real UUIDs, timestamps, and content. Tested: three independent Opus agents given the rebuilt file could not detect the seam — each concluded they were reading an uncompacted conversation.
 
 ## Protocol Steps
 
 ### 1. Restore from backup
+
 Always work from the original uncompacted session file.
 
-### 2. Run rebuild-session.py
+### 2. Write a turn-by-turn summary (recommended)
+
+Deploy an Opus agent with this prompt:
+
+> Read the session JSONL at `<path>`. Write a turn-by-turn summary of the conversation from the beginning through turn N (the last turn before --keep-recent 200).
+>
+> Format:
+> ```
+> USER: <compressed user message>
+> ASSISTANT: <compressed assistant message>
+> USER: ...
+> ```
+>
+> Rules:
+> - Preserve key decisions, shared shorthand, emotional texture
+> - Compress operational noise: heartbeats, monitoring turns, repetitive tool calls
+> - Keep landmark moments at higher detail
+> - Target: ~15-20K tokens total
+>
+> Write output to `session-summary.md`.
+
+**Use Opus.** Sonnet summaries lose emotional texture and shared shorthand. The summary quality is the continuity quality.
+
+### 3. Dry-run the rebuild
+
 ```bash
-python scripts/rebuild-session.py <session.jsonl> --keep-recent 200 --max-chars 300
+python rebuild-session.py <session.jsonl> --keep-recent 200 --summary-file session-summary.md --dry-run
 ```
 
-Parameters:
-- `--keep-recent N` — number of recent conversation messages to preserve at full fidelity (default: 200)
-- `--max-chars N` — max characters per compressed turn before sentence-boundary truncation (default: 300)
-- `--dry-run` — write to `.rebuilt.jsonl` instead of overwriting
+The `--dry-run` flag writes to `<session>.rebuilt.jsonl`. Review it:
+- File size should be under 1MB
+- Estimated tokens should be under 250K
+- First 20 lines should read like natural conversation
 
-### 3. What the script does
+The script automatically spreads summary timestamps across the original date range — no manual timestamp fixing.
+
+### 4. Go live
+
+```bash
+python rebuild-session.py <session.jsonl> --keep-recent 200 --summary-file session-summary.md
+```
+
+Backup is created automatically (`<session>.jsonl.backup-pre-rebuild-<timestamp>`).
+
+### 5. Resume
+
+```bash
+claude --resume <session-id>
+```
+
+No `/clear` needed. The loader reads the whole file and sees a normal conversation.
+
+## Fallback: auto-compression (no summary agent)
+
+When you don't have time to write a summary or the session is short enough that texture loss is acceptable:
+
+```bash
+python rebuild-session.py <session.jsonl> --keep-recent 200 --max-chars 300
+```
+
+Each older turn is truncated at a sentence boundary to `max-chars`. Faster, but loses context texture compared to the Opus-summarized pipeline.
+
+## What the Script Does
 
 **Phase 1: Compress older messages**
+
+*With `--summary-file`:*
+- Parses alternating `USER:` / `ASSISTANT:` turns from the file
+- Spreads timestamps across the original date range (first_ts to last_compressed_ts)
+
+*Without `--summary-file`:*
 - Extracts text from `message.content` (strips tool_use, tool_result, thinking blocks)
-- Drops filler: echoes ("Own echo"), polling messages, short non-substantive responses, Discord routing noise, cron checks
+- Drops filler: echoes, polling messages, short non-substantive responses, Discord routing noise, cron checks
 - Drops `isCompactSummary` / `isVisibleInTranscriptOnly` meta messages
-- Truncates at sentence boundaries (`. `, `! `, `? `) — no ellipsis, no mid-word cuts
-- Creates real JSONL entries with uuid, parentUuid, timestamp, sessionId, cwd
+- Truncates at sentence boundaries — no ellipsis, no mid-word cuts
 
 **Phase 2: Preserve recent entries**
 - Keeps ALL entry types from the split point onward (conversation + system + progress)
-- Drops non-essential: queue-operations, turn_duration, stop_hook_summary, hook_progress
+- Drops non-essential: queue-operations, turn_duration, stop_hook_summary, hook_progress, hook_response
 - Slims oversized tool results (>1500 bytes) to descriptive placeholders
 - Preserves original timestamps, UUIDs, and metadata
 
@@ -59,18 +117,6 @@ Parameters:
 - Linearized parentUuid chain: each entry points to the previous
 - Compact JSON separators on all re-serialized entries (`separators=(',',':')`)
 - Atomic write with backup
-
-### 4. Verify
-- File size should be under 5MB (avoids K48 byte scanner entirely)
-- Estimated tokens should be under 500K (quality target for 1M context)
-- Open the file and spot-check: first 20 lines should read like natural conversation
-
-### 5. Resume
-```bash
-claude --resume <session-id>
-```
-
-No `/clear` needed. No special flags. The loader reads the whole file and sees a normal conversation.
 
 ## Key Parameters
 
@@ -101,7 +147,7 @@ No `/clear` needed. No special flags. The loader reads the whole file and sees a
 
 4. **File under 5MB.** The K48 streaming scanner activates at 5MB. Below that threshold, the loader reads the entire file with `readFile()`. No byte scanning, no prefix matching, no boundary detection. This is why the rebuild approach works — the scanner never runs.
 
-5. **Real UUIDs and timestamps.** Compressed turns get fresh UUIDs (via uuid4) but preserve original timestamps. This maintains chronological ordering without colliding with preserved entries' UUIDs.
+5. **Real UUIDs and timestamps.** Compressed turns get fresh UUIDs (via uuid4). With `--summary-file`, timestamps are spread across the original date range. Without it, original timestamps are preserved from the source entries.
 
 ## Discovered Through
 
@@ -109,4 +155,5 @@ No `/clear` needed. No special flags. The loader reads the whole file and sees a
   1. JSON whitespace — `json.dumps` default spaces broke K48 prefix check
   2. Branching chains — Discord MCP creates parallel parentUuid chains; repair must linearize ALL entries, not just the first
 - **Testing showed** compact_boundary approach always detectable (framing text, grain change)
-- **Rebuild approach** passed blind test — Opus agent couldn't find the seam, thought it was reading the uncompacted original
+- **Rebuild approach** passed blind test — three Opus agents couldn't find the seam, each concluded they were reading the uncompacted original
+- **`--summary-file` added** after validating that Opus-written summaries preserve texture better than auto-truncation, and that timestamp spreading eliminates the last detectable tell
