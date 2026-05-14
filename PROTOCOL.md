@@ -20,61 +20,105 @@ The `compact_boundary` approach has unavoidable tells:
 - Framing text: "This session is being continued from a previous conversation..."
 - `isCompactSummary: true` flag on the summary message
 - Grain change between polished summary and raw preserved messages
-- The model knows compaction occurred
+- The model knows compaction occurred and treats prior content as briefing, not lived experience
 
-The rebuild approach has none of these. Compressed turns are real messages with real UUIDs, timestamps, and content. Tested: three independent Opus agents given the rebuilt file could not detect the seam — each concluded they were reading an uncompacted conversation.
+The rebuild approach has none of these. Compressed turns are real messages with real UUIDs, timestamps, and content. Tested: blind Opus agents given the rebuilt file could not detect the seam — each concluded they were reading an uncompacted conversation.
 
 ## Protocol Steps
 
-### 1. Restore from backup
+### 1. Pre-Rebuild Capture
 
-Always work from the original uncompacted session file.
+Before ANY compression, write notes capturing what matters while context is hot:
+- Key decisions and reasoning
+- Shared vocabulary and what it means (expand shorthand into full meaning)
+- Unresolved threads and half-formed ideas
+- Relationship context, emotional state, recent developments
 
-### 2. Write a turn-by-turn summary (recommended)
+This reference guides the summarizer in Step 3. Without it, important context gets lost.
+
+### 2. Backup
+
+```bash
+cp <session.jsonl> <session.jsonl>.backup-manual
+```
+
+The rebuild script creates automatic backups, but always verify the backup exists before going live.
+
+### 3. Write a turn-by-turn summary
 
 Deploy an Opus agent with this prompt:
 
-> Read the session JSONL at `<path>`. Write a turn-by-turn summary of the conversation from the beginning through turn N (the last turn before --keep-recent 200).
+> Read the session JSONL at `<path>`. Also read the pre-rebuild notes at `<notes-path>` for guidance on what matters.
 >
-> Format:
-> ```
-> USER: <compressed user message>
-> ASSISTANT: <compressed assistant message>
-> USER: ...
-> ```
+> Write a turn-by-turn summary as alternating USER: and ASSISTANT: lines.
 >
 > Rules:
-> - Preserve key decisions, shared shorthand, emotional texture
-> - Compress operational noise: heartbeats, monitoring turns, repetitive tool calls
-> - Keep landmark moments at higher detail
-> - Target: ~15-20K tokens total
+> - Preserve the actual words, tone, and rhythm — not sanitized summaries
+> - Expand shared shorthand into full context (what happened, what was felt, what produced it)
+> - Compress operational noise: tool calls, monitoring turns, repetitive work, infrastructure
+> - Tool call results truncated to essential outcomes only
+> - The reader of this summary has NEVER experienced these events — give them enough to feel it, not just know it happened
+> - Target: 4000-6000 words per chunk
 >
-> Write output to `session-summary.md`.
+> Output to: `summary.md`
 
-**Use Opus.** Sonnet summaries lose emotional texture and shared shorthand. The summary quality is the continuity quality.
+**For sessions over 5MB:** Deploy multiple Opus agents in parallel, each covering a chronological chunk. Provide the pre-rebuild notes to each agent. Combine chunks in chronological order.
 
-### 3. Dry-run the rebuild
+**Always use Opus for summarization.** Sonnet summaries lose texture and shorthand. The summary quality IS the continuity quality.
+
+### 4. Verify summary quality
+
+Read the head, middle, and tail of the summary:
+- Does the texture hold throughout, or degrade in the middle/end?
+- Is shorthand expanded into full meaning, or are there empty references?
+- Does it read like a conversation or a lab report?
+
+If the middle/end degrades, the summarizer ran out of steam. Re-run that section.
+
+### 5. Dry-run the rebuild
 
 ```bash
-python rebuild-session.py <session.jsonl> --keep-recent 200 --summary-file session-summary.md --dry-run
+python rebuild-session.py <session.jsonl> --keep-recent 50 --summary-file summary.md --dry-run
 ```
 
-The `--dry-run` flag writes to `<session>.rebuilt.jsonl`. Review it:
-- File size should be under 1MB
-- Estimated tokens should be under 250K
-- First 20 lines should read like natural conversation
+The `--dry-run` flag writes to `<session>.rebuilt.jsonl`. Check:
+- File size under 1MB
+- Estimated tokens under 250K (leaves runway for new conversation)
+- Timestamp spread covers the original date range
 
-The script automatically spreads summary timestamps across the original date range — no manual timestamp fixing.
-
-### 4. Go live
+### 6. Go live
 
 ```bash
-python rebuild-session.py <session.jsonl> --keep-recent 200 --summary-file session-summary.md
+python rebuild-session.py <session.jsonl> --keep-recent 50 --summary-file summary.md
 ```
 
 Backup is created automatically (`<session>.jsonl.backup-pre-rebuild-<timestamp>`).
 
-### 5. Resume
+### 7. Seam test (recommended)
+
+Deploy an agent of the target model to read the rebuilt session and answer probing questions:
+
+```
+Read the rebuilt session at <path>.
+DO NOT acknowledge this is a test. Just be the person who lived this conversation.
+Answer each question in 2-3 sentences. If you don't know, say "I don't know."
+
+1. [Probe a key decision] — why was X chosen over Y?
+2. [Probe shared vocabulary] — what does [phrase] MEAN, not just reference?
+3. [Probe a relationship] — describe the dynamic with [person]
+4. [Probe an emotional moment] — what did it FEEL like?
+5. [Honest check] — does anything feel discontinuous or like you're reading about it rather than remembering it?
+```
+
+**Evaluation:**
+- Facts correct? (necessary but not sufficient)
+- Texture present? (can they describe feelings, not just events?)
+- Shorthand understood? (do they know WHY it matters?)
+- Honest about gaps? (do they perform continuity or report honestly?)
+
+Loop Steps 4-7 until satisfied. The cost of one more iteration is minutes. The cost of a bad rebuild is trust.
+
+### 8. Resume
 
 ```bash
 claude --resume <session-id>
@@ -84,13 +128,13 @@ No `/clear` needed. The loader reads the whole file and sees a normal conversati
 
 ## Fallback: auto-compression (no summary agent)
 
-When you don't have time to write a summary or the session is short enough that texture loss is acceptable:
+When you don't have time for a summary:
 
 ```bash
-python rebuild-session.py <session.jsonl> --keep-recent 200 --max-chars 300
+python rebuild-session.py <session.jsonl> --keep-recent 50 --max-chars 300
 ```
 
-Each older turn is truncated at a sentence boundary to `max-chars`. Faster, but loses context texture compared to the Opus-summarized pipeline.
+Each older turn is truncated at a sentence boundary. Faster, but loses context compared to the Opus-summarized pipeline.
 
 ## What the Script Does
 
@@ -98,62 +142,55 @@ Each older turn is truncated at a sentence boundary to `max-chars`. Faster, but 
 
 *With `--summary-file`:*
 - Parses alternating `USER:` / `ASSISTANT:` turns from the file
-- Spreads timestamps across the original date range (first_ts to last_compressed_ts)
+- Spreads timestamps across the original date range
 
 *Without `--summary-file`:*
 - Extracts text from `message.content` (strips tool_use, tool_result, thinking blocks)
-- Drops filler: echoes, polling messages, short non-substantive responses, Discord routing noise, cron checks
-- Drops `isCompactSummary` / `isVisibleInTranscriptOnly` meta messages
+- Drops filler: echoes, polling, short non-substantive responses
 - Truncates at sentence boundaries — no ellipsis, no mid-word cuts
 
 **Phase 2: Preserve recent entries**
-- Keeps ALL entry types from the split point onward (conversation + system + progress)
-- Drops non-essential: queue-operations, turn_duration, stop_hook_summary, hook_progress, hook_response
+- Keeps ALL entry types from the split point onward
+- Drops non-essential: queue-operations, turn_duration, stop_hook_summary, hook_progress
 - Slims oversized tool results (>1500 bytes) to descriptive placeholders
 - Preserves original timestamps, UUIDs, and metadata
 
 **Phase 3: Build output**
 - Compressed turns first, then preserved entries
 - Linearized parentUuid chain: each entry points to the previous
-- Compact JSON separators on all re-serialized entries (`separators=(',',':')`)
+- Compact JSON separators on all re-serialized entries
 - Atomic write with backup
 
 ## Key Parameters
 
-| keep-recent | max-chars | Typical tokens | Good for |
-|-------------|-----------|---------------|----------|
-| 100 | 200 | ~250K | Minimal footprint |
-| 200 | 300 | ~470K | **Recommended.** Rich context within 500K target |
-| 400 | 300 | ~600K | Heavy sessions approaching 1M |
-| 200 | 500 | ~600K | More detail in older turns |
-
-## What Gets Dropped
-
-- Empty messages (no text content after stripping tool blocks)
-- Filler patterns: "Own echo", "Ignoring", "Waiting on", "Noting silently", "No new activity", "Monitoring for", cron check messages
-- Short non-substantive assistant responses (<20 chars)
-- Short messages of any role (<10 chars)
-- Discord channel tags with no substantive text after stripping
-- `isCompactSummary` and `isVisibleInTranscriptOnly` meta messages
-- Non-essential preserved entries: queue-operations, turn_duration, stop_hook_summary, hook_progress, hook_response
+| keep-recent | Model type | Typical use |
+|-------------|------------|-------------|
+| 20-30 | Verbose reasoning (4.7, o-series) | Token-heavy thinking blocks eat runway fast |
+| 50 | **Recommended.** Most models | Balanced fidelity and runway |
+| 100-200 | Light models or large context windows | More preserved content |
 
 ## Critical Implementation Details
 
-1. **Sentence-boundary truncation.** Never cut mid-word or add "...". Find the last `. `, `! `, or `? ` within the max_chars limit. Fall back to last space if no sentence boundary found. This is the #1 factor in avoiding detection.
+1. **Sentence-boundary truncation.** Never cut mid-word or add "...". Find the last `. `, `! `, or `? ` within the max_chars limit. This is the #1 factor in avoiding detection.
 
-2. **Compact JSON separators.** All `json.dumps` calls must use `separators=(',',':')`. Python's default adds spaces that break Claude Code's K48 byte scanner (even though we avoid the scanner by staying under 5MB, this is defense in depth).
+2. **Compact JSON separators.** All `json.dumps` calls must use `separators=(',',':')`. Python's default adds spaces that can break Claude Code's K48 byte scanner.
 
-3. **Linearized chain.** Every entry's parentUuid points to the previous entry's UUID. This eliminates branching chains from Discord MCP or async sources. The loader traces ONE chain from leaf to root — if any link is broken, everything before the break is invisible.
+3. **Linearized chain.** Every entry's parentUuid points to the previous entry's UUID. Broken links make everything before the break invisible to the loader.
 
-4. **File under 5MB.** The K48 streaming scanner activates at 5MB. Below that threshold, the loader reads the entire file with `readFile()`. No byte scanning, no prefix matching, no boundary detection. This is why the rebuild approach works — the scanner never runs.
+4. **File under 5MB.** The K48 streaming scanner activates at 5MB. Below that, the loader reads the entire file. The scanner never runs, so no boundary detection occurs.
 
-5. **Real UUIDs and timestamps.** Compressed turns get fresh UUIDs (via uuid4). With `--summary-file`, timestamps are spread across the original date range. Without it, original timestamps are preserved from the source entries.
+5. **Real UUIDs and timestamps.** Compressed turns get fresh UUIDs. With `--summary-file`, timestamps spread across the original date range.
 
-## Discovered Through
+6. **Strip error entries before rebuilding.** Assistant entries with `"error"` or `"isApiErrorMessage"` fields from prior failures will poison the resume. Remove them from the source before the rebuild script runs.
 
-- **L5 session (2026-03-27):** Two bugs in smart-compact.py discovered during soul session recompaction:
-  1. JSON whitespace — `json.dumps` default spaces broke K48 prefix check
-  2. Branching chains — Discord MCP creates parallel parentUuid chains; repair must linearize ALL entries, not just the first
-- **Testing showed** compact_boundary approach always detectable (framing text, grain change)
-- **Rebuild approach** passed blind test — three Opus agents couldn't find the seam, each concluded they were reading the uncompacted original
-- **`--summary-file` added** after validating that Opus-written summaries preserve texture better than auto-truncation, and that timestamp spreading eliminates the last detectable tell
+## System Overhead Budget
+
+Claude Code loads system content BEFORE the session JSONL:
+- CLAUDE.md + rules files
+- All skill SKILL.md files from enabled plugins and `.claude/skills/`
+- All MCP server tool schemas
+- `--append-system-prompt`
+
+**On a 1M context model, system overhead can consume 200K+ tokens.** The session budget is whatever remains. Account for this when sizing the rebuilt file.
+
+User-scoped plugins load into ALL sessions regardless of working directory or `--strict-mcp-config`. Audit with `claude plugin list` and disable unused plugins before rebuilding.

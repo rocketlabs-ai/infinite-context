@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
-"""Smart Compact: Context pruner for Claude Code session JSONL files.
+"""Smart Compact v3: Infinite Context pruner for Claude Code session JSONL files.
 
-Extends Claude Code sessions beyond the context window by inserting a
-compact_boundary marker + narrative summary + preserved recent messages.
-Format matches Claude Code's native /compact output exactly.
+Architecture: Mimics Claude Code's built-in /compact exactly, using field formats
+verified by deep source trace of cli.js (scratchpad/claude-code-deep-trace.md).
 
-Usage:
-    python smart-compact.py [session_file] [options]
-    python smart-compact.py --dry-run --keep-recent 500
-    python smart-compact.py --auto-summarize --keep-recent 500
+Appends a compact_boundary system message + summary user message, then preserves
+the last N messages with correct parentUuid chain and preservedSegment metadata.
 
-See README.md for full documentation.
+v1 failed: pruned in-place without compact_boundary — loader read entire gutted file.
+v2 failed: missing preCompactDiscoveredTools, preservedSegment, wrong content format.
+v3: exact field-for-field match with Claude Code's compaction output.
 """
 
 import argparse
@@ -18,7 +17,6 @@ import json
 import os
 import shutil
 import sys
-import tempfile
 import uuid as uuid_mod
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,18 +31,12 @@ def find_latest_session() -> Path | None:
     claude_dir = Path.home() / ".claude" / "projects"
     if not claude_dir.exists():
         return None
-    jsonl_files = sorted(
-        claude_dir.glob("**/*.jsonl"),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    # Skip subagent files
-    jsonl_files = [f for f in jsonl_files if "subagents" not in str(f)]
+    jsonl_files = sorted(claude_dir.glob("**/*.jsonl"), key=lambda p: p.stat().st_mtime, reverse=True)
     return jsonl_files[0] if jsonl_files else None
 
 
 def content_byte_size(content) -> int:
-    """Calculate byte size of a content field (string or list)."""
+    """Calculate byte size of a tool_result content field (string or list)."""
     if isinstance(content, str):
         return len(content.encode("utf-8"))
     if isinstance(content, list):
@@ -101,7 +93,7 @@ def is_conversation_message(obj: dict) -> bool:
 
 
 def is_any_message(obj: dict) -> bool:
-    """Return True if this entry is any message type the session loader processes."""
+    """Return True if this JSONL entry is any message type that G26 loads into the map."""
     return obj.get("type") in ("user", "assistant", "attachment", "system", "progress")
 
 
@@ -132,7 +124,8 @@ def extract_content_blocks(obj: dict) -> list | None:
 
 
 def extract_discovered_tools(lines: list[tuple[str, dict | None]]) -> list[str]:
-    """Extract unique tool names from all tool_use blocks in the session."""
+    """Extract unique tool names from all tool_use blocks in the session.
+    This populates compactMetadata.preCompactDiscoveredTools."""
     tools = set()
     for _raw, obj in lines:
         if obj is None:
@@ -168,213 +161,11 @@ def index_tool_uses(lines: list[tuple[str, dict | None]]) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Conversation extraction (for narrative summary generation)
-# ---------------------------------------------------------------------------
-
-def extract_conversation_text(lines: list[tuple[str, dict | None]],
-                              end_index: int) -> list[str]:
-    """Extract conversation turns as plain text, stripping tool blocks.
-
-    Returns a list of "ROLE: text" strings suitable for summarization.
-    Only processes lines up to end_index (the split point).
-    """
-    turns = []
-    for i, (_raw, obj) in enumerate(lines):
-        if i >= end_index:
-            break
-        if obj is None or not is_conversation_message(obj):
-            continue
-
-        role = obj.get("type", "?")
-        content = obj.get("message", {}).get("content", "")
-
-        if isinstance(content, str):
-            text = content
-        elif isinstance(content, list):
-            text_parts = []
-            for block in content:
-                if isinstance(block, dict):
-                    if block.get("type") == "text":
-                        text_parts.append(block.get("text", ""))
-                    # Skip tool_use, tool_result, thinking, image blocks
-                elif isinstance(block, str):
-                    text_parts.append(block)
-            text = "\n".join(text_parts)
-        else:
-            text = str(content)
-
-        text = text.strip()
-        if text:
-            turns.append(f"{role.upper()}: {text}")
-
-    return turns
-
-
-# ---------------------------------------------------------------------------
-# Auto-summarize via LLM (Ollama local or OpenAI-compatible API)
-# ---------------------------------------------------------------------------
-
-SUMMARY_PROMPT = """\
-You are a conversation summarizer. Read the conversation below and produce \
-a chronological summary that preserves the flow, decisions, and relationship \
-dynamics between the participants.
-
-Requirements:
-- Maintain chronological order
-- Preserve who said what and when decisions were made
-- Keep relationship dynamics, tone shifts, and trust building
-- Preserve key decisions, technical choices, and project milestones
-- Remove tool execution details but keep references to what tools accomplished
-- Keep all names, project names, and specific technical terms
-- Aim for roughly 10-15% of the original length
-- Use a narrative style with clear topic/time markers where identifiable
-- Do NOT editorialize — faithfully compress what happened
-
-Structure:
-1. Brief overview (2-3 sentences)
-2. Chronological narrative organized by topic arcs
-3. Key decisions and their rationale
-4. Open threads at the end
-
-Conversation:
-"""
-
-
-def auto_summarize(conversation_text: str,
-                   model: str = "qwen3:8b",
-                   base_url: str = "http://localhost:11434/v1",
-                   api_key: str | None = None) -> str:
-    """Generate a narrative summary via an OpenAI-compatible API.
-
-    Default: Ollama running locally (free, no API key).
-    Set --base-url and --api-key for any OpenAI-compatible endpoint
-    (Anthropic, OpenRouter, Together, etc).
-    """
-    import urllib.request
-    import urllib.error
-
-    api_url = base_url.rstrip("/")
-    chat_url = f"{api_url}/chat/completions"
-
-    # Chunk if conversation is too large for the model context
-    # Most local models: 8K-128K context. Be conservative.
-    max_input_chars = 120_000  # ~30K tokens, safe for most models
-    chunks = []
-    if len(conversation_text) > max_input_chars:
-        turns = conversation_text.split("\n\n---\n\n")
-        current_chunk = []
-        current_size = 0
-        for turn in turns:
-            turn_size = len(turn) + 7
-            if current_size + turn_size > max_input_chars and current_chunk:
-                chunks.append("\n\n---\n\n".join(current_chunk))
-                current_chunk = [turn]
-                current_size = turn_size
-            else:
-                current_chunk.append(turn)
-                current_size += turn_size
-        if current_chunk:
-            chunks.append("\n\n---\n\n".join(current_chunk))
-    else:
-        chunks = [conversation_text]
-
-    print(f"Summarizing with {model} via {api_url} "
-          f"({len(chunks)} chunk{'s' if len(chunks) > 1 else ''})...")
-
-    summaries = []
-    for i, chunk in enumerate(chunks):
-        if len(chunks) > 1:
-            print(f"  Chunk {i + 1}/{len(chunks)} "
-                  f"(~{len(chunk) // 4:,} tokens)...")
-
-        payload = json.dumps({
-            "model": model,
-            "messages": [
-                {"role": "user", "content": SUMMARY_PROMPT + chunk}
-            ],
-            "stream": False,
-        }).encode("utf-8")
-
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-
-        req = urllib.request.Request(
-            chat_url,
-            data=payload,
-            headers=headers,
-            method="POST",
-        )
-
-        try:
-            with urllib.request.urlopen(req, timeout=600) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")[:500]
-            print(f"API error ({e.code}): {body}", file=sys.stderr)
-            sys.exit(1)
-        except urllib.error.URLError as e:
-            print(f"Error connecting to {api_url}: {e}", file=sys.stderr)
-            if not api_key and "localhost" in api_url:
-                print("Make sure Ollama is running: ollama serve",
-                      file=sys.stderr)
-            sys.exit(1)
-
-        summary = data["choices"][0]["message"]["content"]
-        summaries.append(summary)
-
-        usage = data.get("usage", {})
-        tokens_in = usage.get("prompt_tokens", "?")
-        tokens_out = usage.get("completion_tokens", "?")
-        print(f"  {'Done' if len(chunks) == 1 else f'Chunk {i + 1} done'}: "
-              f"{tokens_in} in / {tokens_out} out")
-
-    if len(summaries) == 1:
-        return summaries[0]
-
-    # Merge pass for multiple chunks
-    print("  Merging chunk summaries...")
-    merge_prompt = (
-        "Merge these chronological summaries into one cohesive narrative. "
-        "Maintain chronological order, remove redundancy, preserve all key "
-        "decisions and open threads.\n\n"
-        + "\n\n---\n\n".join(summaries)
-    )
-
-    payload = json.dumps({
-        "model": model,
-        "messages": [{"role": "user", "content": merge_prompt}],
-        "stream": False,
-    }).encode("utf-8")
-
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-
-    req = urllib.request.Request(
-        chat_url,
-        data=payload,
-        headers=headers,
-        method="POST",
-    )
-
-    with urllib.request.urlopen(req, timeout=600) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
-
-    merged = data["choices"][0]["message"]["content"]
-    usage = data.get("usage", {})
-    print(f"  Merge done: {usage.get('prompt_tokens', '?')} in / "
-          f"{usage.get('completion_tokens', '?')} out")
-    return merged
-
-
-# ---------------------------------------------------------------------------
 # Tool result summarization (for post-boundary slimming)
 # ---------------------------------------------------------------------------
 
-def make_tool_summary(tool_name: str | None, tool_input: dict | None,
-                      content) -> str:
-    """Generate a contextual summary from the paired tool_use info."""
+def make_summary(tool_name: str | None, tool_input: dict | None, content) -> str:
+    """Generate a contextual summary from the paired tool_use info and result content."""
     original_bytes = content_byte_size(content)
     if isinstance(content, str):
         text = content
@@ -397,8 +188,8 @@ def make_tool_summary(tool_name: str | None, tool_input: dict | None,
     name_lower = tool_name.lower()
 
     if name_lower in ("read", "view"):
-        fp = inp.get("file_path", inp.get("path", "?"))
-        return f"[Read {fp} — {lines} lines, {original_bytes:,} bytes]"
+        file_path = inp.get("file_path", inp.get("path", "?"))
+        return f"[Read {file_path} — {lines} lines, {original_bytes:,} bytes]"
     if name_lower in ("bash", "shell"):
         cmd = inp.get("command", "?")
         if len(cmd) > 120:
@@ -413,16 +204,15 @@ def make_tool_summary(tool_name: str | None, tool_input: dict | None,
         path = inp.get("path", ".")
         return f"[Listed files matching '{pattern}' in {path} — {lines} lines]"
     if name_lower in ("edit",):
-        fp = inp.get("file_path", inp.get("path", "?"))
-        return f"[Edited {fp} — result {original_bytes:,} bytes]"
+        file_path = inp.get("file_path", inp.get("path", "?"))
+        return f"[Edited {file_path} — result {original_bytes:,} bytes]"
     if name_lower in ("write",):
-        fp = inp.get("file_path", inp.get("path", "?"))
-        return f"[Wrote {fp} — result {original_bytes:,} bytes]"
-    return f"[Tool '{tool_name}' completed — {lines} lines, {original_bytes:,} bytes]"
+        file_path = inp.get("file_path", inp.get("path", "?"))
+        return f"[Wrote {file_path} — result {original_bytes:,} bytes]"
+    return f"[Tool '{tool_name}' completed — {lines} lines, {original_bytes:,} bytes of output]"
 
 
-def slim_tool_result_block(block: dict, tool_index: dict,
-                           threshold: int) -> bool:
+def slim_tool_result_block(block: dict, tool_index: dict, threshold: int) -> bool:
     """Slim a single tool_result block if oversized. Returns True if slimmed."""
     if not isinstance(block, dict) or block.get("type") != "tool_result":
         return False
@@ -436,7 +226,7 @@ def slim_tool_result_block(block: dict, tool_index: dict,
     tool_info = tool_index.get(tool_use_id)
     tool_name = tool_info["name"] if tool_info else None
     tool_input = tool_info["input"] if tool_info else None
-    block["content"] = make_tool_summary(tool_name, tool_input, content)
+    block["content"] = make_summary(tool_name, tool_input, content)
     return True
 
 
@@ -456,17 +246,16 @@ def slim_thinking_block(block: dict, threshold: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Compact boundary + summary construction (exact Claude Code format)
+# Compact boundary + summary construction (v3 — exact Claude Code format)
 # ---------------------------------------------------------------------------
 
 def build_compact_boundary(last_message_uuid: str, session_id: str,
                            cwd: str, pre_token_estimate: int,
                            discovered_tools: list[str],
                            preserved_segment: dict | None) -> dict:
-    """Build a compact_boundary system entry matching Claude Code's format.
+    """Build a compact_boundary system entry matching Claude Code's exact format.
 
-    Field format verified against Claude Code cli.js source.
-    See docs/claude-code-deep-trace.md section 3.5.
+    Based on kd6() and oR1() from cli.js (deep trace section 3.5).
     """
     metadata = {
         "trigger": "smart-compact",
@@ -496,20 +285,20 @@ def build_compact_boundary(last_message_uuid: str, session_id: str,
 def build_summary_message(boundary_uuid: str, session_id: str,
                           cwd: str, summary_text: str,
                           session_path: str) -> dict:
-    """Build the summary user message matching Claude Code's format.
+    """Build the summary user message matching Claude Code's exact format.
 
-    Content is a plain string (not content blocks array).
-    See docs/claude-code-deep-trace.md section 3.6.
+    Based on F8() with compaction flags (deep trace section 3.6).
+    Content is a plain string (not content blocks array) to match the native format.
     """
     full_text = (
         "This session is being continued from a previous conversation "
         "that ran out of context. The summary below covers the earlier "
         "portion of the conversation.\n\n"
-        + summary_text
-        + "\n\nIf you need specific details from before compaction "
+        + summary_text +
+        "\n\nIf you need specific details from before compaction "
         "(like exact code snippets, error messages, or content you generated), "
-        "read the full transcript at: " + session_path
-        + "\n\nRecent messages are preserved verbatim.\n"
+        "read the full transcript at: " + session_path +
+        "\n\nRecent messages are preserved verbatim.\n"
         "Continue the conversation from where it left off without asking "
         "the user any further questions. Resume directly -- do not "
         "acknowledge the summary, do not recap what was happening, "
@@ -538,12 +327,11 @@ def build_summary_message(boundary_uuid: str, session_id: str,
 # Core: determine split point
 # ---------------------------------------------------------------------------
 
-def find_split_point(lines: list[tuple[str, dict | None]],
-                     keep_recent: int) -> int:
-    """Find the split index. Everything before this is summarized,
+def find_split_point(lines: list[tuple[str, dict | None]], keep_recent: int) -> int:
+    """Find the split index: everything before this becomes pre-boundary (summarized),
     everything from this index forward is preserved.
 
-    Respects tool_use/tool_result pairing.
+    Respects tool_use/tool_result pairing — won't split in the middle of a pair.
     """
     conv_indices = []
     for i, (_raw, obj) in enumerate(lines):
@@ -556,7 +344,7 @@ def find_split_point(lines: list[tuple[str, dict | None]],
     split_conv_idx = len(conv_indices) - keep_recent
     split_line_idx = conv_indices[split_conv_idx]
 
-    # Don't split a tool_use/tool_result pair
+    # Walk backward to ensure we don't split a tool_use/tool_result pair.
     _, split_obj = lines[split_line_idx]
     if split_obj and split_obj.get("type") == "user":
         content = extract_content_blocks(split_obj)
@@ -604,55 +392,51 @@ def extract_session_metadata(lines: list[tuple[str, dict | None]]) -> dict:
 
 def repair_preserved_chain(preserved_lines: list[tuple[str, dict | None]],
                            anchor_uuid: str) -> dict:
-    """Fix the parentUuid chain for preserved messages.
+    """Linearize the parentUuid chain for all preserved messages.
 
-    The session loader (Vs6 in cli.js) traces from the leaf backward via
-    parentUuid. Any message whose parentUuid points outside the preserved
-    section creates a chain break — the loader stops there and never
-    reaches the summary.
+    The session loader (Vs6 in cli.js) traces ONE chain from the leaf
+    backward via parentUuid. Any message not on that chain is invisible
+    to the model. Sessions with Discord MCP or async sources have
+    branching chains — the loader only follows one branch.
 
-    Discord integration and other async sources create branching chains,
-    so there can be MULTIPLE chain roots in the preserved section, not
-    just the first message. All orphaned parentUuids must be re-linked
-    to the anchor (summary message UUID).
+    Fix: rewrite every message's parentUuid to form a single linear
+    chain in file order. First message links to anchor (summary),
+    each subsequent message links to the previous. The loader sees
+    every preserved message as one continuous conversation.
 
     Returns preservedSegment metadata: {headUuid, anchorUuid, tailUuid}.
     """
-    head_uuid = None
-    tail_uuid = None
-
-    # Build set of all UUIDs in preserved segment
-    preserved_uuids = set()
-    for _raw, obj in preserved_lines:
+    # Collect indices of all entries that have UUIDs (messages the loader tracks)
+    uuid_entries = []
+    for i, (_raw, obj) in enumerate(preserved_lines):
         if obj and obj.get("uuid"):
-            preserved_uuids.add(obj["uuid"])
-            if head_uuid is None:
-                head_uuid = obj["uuid"]
-            tail_uuid = obj["uuid"]
+            uuid_entries.append(i)
 
-    # Also include the anchor itself (summary UUID) as a valid target
-    preserved_uuids.add(anchor_uuid)
+    if not uuid_entries:
+        return {
+            "headUuid": anchor_uuid,
+            "anchorUuid": anchor_uuid,
+            "tailUuid": anchor_uuid,
+        }
 
-    # Repair ALL orphaned parentUuids — any message whose parent
-    # points outside the preserved section gets re-linked to anchor
-    repaired = 0
-    for i, (raw, obj) in enumerate(preserved_lines):
-        if obj is None:
-            continue
-        parent = obj.get("parentUuid")
-        if parent and parent not in preserved_uuids:
-            obj["parentUuid"] = anchor_uuid
-            preserved_lines[i] = (json.dumps(obj, ensure_ascii=False,
-                                             separators=(',', ':')), obj)
-            repaired += 1
+    head_uuid = preserved_lines[uuid_entries[0]][1]["uuid"]
+    tail_uuid = preserved_lines[uuid_entries[-1]][1]["uuid"]
 
-    if repaired:
-        print(f"Repaired {repaired} orphaned parentUuid link(s) in preserved section")
+    # Linearize: each entry's parentUuid points to the previous entry's UUID
+    prev_uuid = anchor_uuid
+    for idx in uuid_entries:
+        _raw, obj = preserved_lines[idx]
+        obj["parentUuid"] = prev_uuid
+        preserved_lines[idx] = (json.dumps(obj, ensure_ascii=False,
+                                           separators=(',', ':')), obj)
+        prev_uuid = obj["uuid"]
+
+    print(f"Linearized {len(uuid_entries)} entries into single chain")
 
     return {
-        "headUuid": head_uuid or anchor_uuid,
+        "headUuid": head_uuid,
         "anchorUuid": anchor_uuid,
-        "tailUuid": tail_uuid or anchor_uuid,
+        "tailUuid": tail_uuid,
     }
 
 
@@ -666,7 +450,7 @@ def load_summary_content(summary_path: Path | None) -> str:
         return summary_path.read_text(encoding="utf-8")
     return (
         "Summary:\n"
-        "The previous conversation context was compacted. "
+        "The previous conversation context was compacted by Smart Compact v3. "
         "Specific details of earlier tool results and file reads were condensed. "
         "Recent conversation messages are preserved in full below."
     )
@@ -680,12 +464,8 @@ def estimate_tokens(lines: list[tuple[str, dict | None]]) -> int:
 
 def smart_compact(session_path: Path, threshold: int, keep_recent: int,
                   prune_thinking: bool, dry_run: bool, no_backup: bool,
-                  summary_path: Path | None,
-                  extract_conversation: Path | None,
-                  auto_summarize_model: str | None = None,
-                  auto_summarize_base_url: str = "http://localhost:11434/v1",
-                  auto_summarize_api_key: str | None = None) -> None:
-    """Main compact logic."""
+                  summary_path: Path | None) -> None:
+    """Main v3 compact logic: exact Claude Code format."""
 
     if not session_path.exists():
         print(f"Error: File not found: {session_path}", file=sys.stderr)
@@ -698,8 +478,7 @@ def smart_compact(session_path: Path, threshold: int, keep_recent: int,
     # Parse
     all_lines = parse_jsonl(session_path)
     total_entries = len([1 for _, obj in all_lines if obj is not None])
-    conv_count = len([1 for _, obj in all_lines
-                      if obj and is_conversation_message(obj)])
+    conv_count = len([1 for _, obj in all_lines if obj and is_conversation_message(obj)])
     print(f"Entries: {total_entries} total, {conv_count} conversation messages")
 
     # Check for existing compact boundary
@@ -714,13 +493,11 @@ def smart_compact(session_path: Path, threshold: int, keep_recent: int,
         work_lines = all_lines
         prefix_lines = []
 
-    work_conv_count = len([1 for _, obj in work_lines
-                          if obj and is_conversation_message(obj)])
+    work_conv_count = len([1 for _, obj in work_lines if obj and is_conversation_message(obj)])
     print(f"Messages in working set: {work_conv_count}")
 
     if work_conv_count <= keep_recent:
-        print(f"Only {work_conv_count} conversation messages "
-              f"— below --keep-recent {keep_recent}. Nothing to compact.")
+        print(f"Only {work_conv_count} conversation messages — below --keep-recent {keep_recent}. Nothing to compact.")
         return
 
     # Find split point
@@ -732,68 +509,30 @@ def smart_compact(session_path: Path, threshold: int, keep_recent: int,
     pre_split = work_lines[:split_idx]
     post_split = work_lines[split_idx:]
 
-    pre_conv = len([1 for _, obj in pre_split
-                    if obj and is_conversation_message(obj)])
-    post_conv = len([1 for _, obj in post_split
-                     if obj and is_conversation_message(obj)])
-    print(f"Will summarize {pre_conv} messages, "
-          f"preserve {post_conv} recent messages")
-
-    # Extract conversation mode: write stripped text and exit
-    if extract_conversation is not None:
-        turns = extract_conversation_text(work_lines, split_idx)
-        with open(extract_conversation, "w", encoding="utf-8") as f:
-            f.write("\n\n---\n\n".join(turns))
-        print(f"\nExtracted {len(turns)} conversation turns "
-              f"to: {extract_conversation}")
-        print(f"Size: {format_size(extract_conversation.stat().st_size)}")
-        est = extract_conversation.stat().st_size // 4
-        print(f"Estimated tokens: ~{est:,}")
-        print("\nGenerate a summary from this file, then re-run with "
-              "--summary-file <path>")
-        return
-
-    # Auto-summarize: extract conversation, call API, use result as summary
-    if auto_summarize_model and summary_path is None:
-        turns = extract_conversation_text(work_lines, split_idx)
-        if turns:
-            conversation_text = "\n\n---\n\n".join(turns)
-            print(f"Extracted {len(turns)} turns for summarization "
-                  f"(~{len(conversation_text) // 4:,} tokens)")
-            generated_summary = auto_summarize(
-                conversation_text,
-                model=auto_summarize_model,
-                base_url=auto_summarize_base_url,
-                api_key=auto_summarize_api_key,
-            )
-            summary_path = session_path.with_suffix(".summary.md")
-            summary_path.write_text(generated_summary, encoding="utf-8")
-            print(f"Summary written to: {summary_path} "
-                  f"({format_size(summary_path.stat().st_size)})")
-        else:
-            print("No conversation text found for summarization.")
+    pre_conv = len([1 for _, obj in pre_split if obj and is_conversation_message(obj)])
+    post_conv = len([1 for _, obj in post_split if obj and is_conversation_message(obj)])
+    print(f"Will summarize {pre_conv} messages, preserve {post_conv} recent messages")
 
     # Extract metadata
     meta = extract_session_metadata(all_lines)
 
-    # UUID of last message before split
+    # Find UUID of last message before split
     last_pre_uuid = meta["last_uuid"]
     for _raw, obj in reversed(pre_split):
         if obj and obj.get("uuid"):
             last_pre_uuid = obj["uuid"]
             break
 
-    # Token estimate
+    # Estimate tokens in pre-split
     pre_tokens = estimate_tokens(all_lines)
 
-    # Discovered tools from entire session
+    # Extract discovered tools from ENTIRE session (pre-boundary + working set)
     discovered_tools = extract_discovered_tools(all_lines)
-    print(f"Discovered tools: {len(discovered_tools)} "
-          f"({', '.join(discovered_tools[:8])}"
-          f"{'...' if len(discovered_tools) > 8 else ''})")
+    print(f"Discovered tools: {len(discovered_tools)} ({', '.join(discovered_tools[:8])}{'...' if len(discovered_tools) > 8 else ''})")
 
-    # Build summary message (need UUID for preservedSegment)
+    # Build summary message first (need its UUID for preservedSegment)
     summary_text = load_summary_content(summary_path)
+    # Placeholder boundary UUID — we'll set it after building boundary
     boundary_uuid = new_uuid()
 
     summary_msg = build_summary_message(
@@ -808,7 +547,7 @@ def smart_compact(session_path: Path, threshold: int, keep_recent: int,
     # Repair parentUuid chain and get preservedSegment metadata
     preserved_segment = repair_preserved_chain(post_split, summary_uuid)
 
-    # Build compact_boundary
+    # Build compact_boundary with preservedSegment
     boundary = build_compact_boundary(
         last_message_uuid=last_pre_uuid,
         session_id=meta["session_id"],
@@ -817,6 +556,7 @@ def smart_compact(session_path: Path, threshold: int, keep_recent: int,
         discovered_tools=discovered_tools,
         preserved_segment=preserved_segment,
     )
+    # Set the pre-allocated UUID
     boundary["uuid"] = boundary_uuid
 
     # Slim oversized tool_results in preserved section
@@ -847,32 +587,44 @@ def smart_compact(session_path: Path, threshold: int, keep_recent: int,
         if modified:
             post_split[i] = (json.dumps(obj, ensure_ascii=False, separators=(',', ':')), obj)
 
-    # Assemble output
+    # Assemble output: all original content + boundary + summary + preserved
+    # The loader skips everything before the last compact_boundary
     output_lines = []
+
+    # Keep original pre-boundary lines intact
     for raw, _obj in prefix_lines:
         output_lines.append(raw)
+
+    # Keep pre-split lines (skipped by loader due to new boundary)
     for raw, _obj in pre_split:
         output_lines.append(raw)
+
+    # Append new compact_boundary
     # CRITICAL: Use compact separators (no spaces) so K48 byte scanner
     # in Claude Code's session loader can match the '{"type":"system"' prefix.
     # Python's default json.dumps adds spaces after : and , which breaks the scan.
     output_lines.append(json.dumps(boundary, ensure_ascii=False, separators=(',', ':')))
+
+    # Append summary message (also compact for consistency)
     output_lines.append(json.dumps(summary_msg, ensure_ascii=False, separators=(',', ':')))
+
+    # Append preserved recent messages
     for raw, _obj in post_split:
         output_lines.append(raw)
 
-    # Output path
+    # Determine output path
     if dry_run:
-        output_path = session_path.with_suffix(".compact.jsonl")
+        output_path = session_path.with_suffix(".compact-v3.jsonl")
     else:
         output_path = session_path
         if not no_backup:
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            backup_path = Path(f"{session_path}.backup-{ts}")
+            backup_path = Path(f"{session_path}.backup-v3.{ts}")
             shutil.copy2(session_path, backup_path)
             print(f"Backup: {backup_path}")
 
-    # Atomic write
+    # Write atomically: temp file then rename
+    import tempfile
     tmp_fd, tmp_path = tempfile.mkstemp(
         suffix=".jsonl", dir=str(output_path.parent)
     )
@@ -889,13 +641,12 @@ def smart_compact(session_path: Path, threshold: int, keep_recent: int,
         raise
 
     size_after = output_path.stat().st_size
-    post_boundary_size = sum(
-        len(l.encode("utf-8"))
-        for l in output_lines[-(len(post_split) + 2):]
-    )
+
+    # Estimate context savings (what the loader actually reads)
+    post_boundary_size = sum(len(l.encode("utf-8")) for l in output_lines[-(len(post_split) + 2):])
 
     print()
-    print("--- Smart Compact Results ---")
+    print("--- Smart Compact v3 Results ---")
     print(f"Messages summarized:   {pre_conv}")
     print(f"Messages preserved:    {post_conv}")
     print(f"Tool results found:    {tool_results_found}")
@@ -905,7 +656,7 @@ def smart_compact(session_path: Path, threshold: int, keep_recent: int,
     print(f"Discovered tools:      {len(discovered_tools)}")
     print(f"File size before: {format_size(size_before)}")
     print(f"File size after:  {format_size(size_after)}")
-    print(f"Context on resume: ~{format_size(post_boundary_size)}")
+    print(f"Context loaded on resume: ~{format_size(post_boundary_size)}")
     print(f"  (loader skips everything before compact_boundary)")
     est_tokens = post_boundary_size // 4
     print(f"Estimated tokens on resume: ~{est_tokens:,}")
@@ -914,6 +665,7 @@ def smart_compact(session_path: Path, threshold: int, keep_recent: int,
     else:
         print(f"\nCompacted in place: {output_path}")
 
+    # Verify integrity
     print("\n--- Integrity Check ---")
     verify_output(output_path)
 
@@ -930,15 +682,16 @@ def verify_output(path: Path) -> None:
     else:
         print(f"OK: compact_boundary at line {boundary_idx + 1}")
 
-    # 2. Summary follows boundary
+    # 2. Summary message follows boundary
     if boundary_idx >= 0 and boundary_idx + 1 < len(lines):
         _, summary_obj = lines[boundary_idx + 1]
         if summary_obj and summary_obj.get("isCompactSummary"):
             print("OK: Summary message follows boundary")
+            # Verify content is a string (not blocks array)
             msg = summary_obj.get("message", {})
             content = msg.get("content")
             if isinstance(content, str):
-                print("OK: Summary content is plain string")
+                print("OK: Summary content is plain string (matches native format)")
             else:
                 errors.append("WARN: Summary content is not a plain string")
         else:
@@ -946,7 +699,7 @@ def verify_output(path: Path) -> None:
     else:
         errors.append("FAIL: Nothing after compact_boundary")
 
-    # 3. compactMetadata fields
+    # 3. compactMetadata has required fields
     if boundary_idx >= 0:
         _, boundary_obj = lines[boundary_idx]
         if boundary_obj:
@@ -961,26 +714,24 @@ def verify_output(path: Path) -> None:
                 errors.append("FAIL: Missing compactMetadata.preTokens")
             if "preCompactDiscoveredTools" in cm:
                 tools = cm["preCompactDiscoveredTools"]
-                print(f"OK: preCompactDiscoveredTools = {len(tools)} tools")
+                print(f"OK: compactMetadata.preCompactDiscoveredTools = {len(tools)} tools")
             else:
-                errors.append("FAIL: Missing preCompactDiscoveredTools")
+                errors.append("FAIL: Missing compactMetadata.preCompactDiscoveredTools")
             if "preservedSegment" in cm:
                 ps = cm["preservedSegment"]
-                has_all = all(
-                    k in ps for k in ("headUuid", "anchorUuid", "tailUuid")
-                )
+                has_all = all(k in ps for k in ("headUuid", "anchorUuid", "tailUuid"))
                 if has_all:
-                    print("OK: preservedSegment has all required keys")
+                    print("OK: compactMetadata.preservedSegment has headUuid/anchorUuid/tailUuid")
                 else:
-                    errors.append("WARN: preservedSegment missing keys")
+                    errors.append("WARN: preservedSegment missing required keys")
             else:
-                errors.append("WARN: Missing preservedSegment")
+                errors.append("WARN: Missing compactMetadata.preservedSegment")
             if boundary_obj.get("logicalParentUuid"):
                 print("OK: logicalParentUuid present")
             else:
                 errors.append("FAIL: Missing logicalParentUuid")
 
-    # 4. Tool pairing in post-boundary
+    # 4. Tool use/result pairing in post-boundary
     if boundary_idx >= 0:
         post_boundary = lines[boundary_idx + 1:]
         tool_uses = {}
@@ -998,38 +749,29 @@ def verify_output(path: Path) -> None:
                     tool_uses[block.get("id")] = True
                 if block.get("type") == "tool_result":
                     tool_results.add(block.get("tool_use_id"))
+
         orphaned_results = tool_results - set(tool_uses.keys())
         orphaned_uses = set(tool_uses.keys()) - tool_results
         if not orphaned_results and not orphaned_uses:
             print(f"OK: {len(tool_uses)} tool_use/tool_result pairs intact")
         else:
             if orphaned_results:
-                errors.append(
-                    f"WARN: {len(orphaned_results)} tool_results "
-                    f"without matching tool_use"
-                )
+                errors.append(f"WARN: {len(orphaned_results)} tool_results without matching tool_use")
             if orphaned_uses:
-                errors.append(
-                    f"WARN: {len(orphaned_uses)} tool_uses "
-                    f"without matching tool_result"
-                )
+                errors.append(f"WARN: {len(orphaned_uses)} tool_uses without matching tool_result")
 
     # 5. Summary links to boundary
     if boundary_idx >= 0 and boundary_idx + 1 < len(lines):
         _, boundary_obj_check = lines[boundary_idx]
         _, summary_obj = lines[boundary_idx + 1]
-        boundary_uuid_check = (
-            boundary_obj_check.get("uuid") if boundary_obj_check else None
-        )
-        summary_parent = (
-            summary_obj.get("parentUuid") if summary_obj else None
-        )
+        boundary_uuid_check = boundary_obj_check.get("uuid") if boundary_obj_check else None
+        summary_parent = summary_obj.get("parentUuid") if summary_obj else None
         if boundary_uuid_check and summary_parent == boundary_uuid_check:
-            print("OK: Summary links to boundary")
+            print("OK: Summary parentUuid links to boundary")
         elif boundary_uuid_check:
             errors.append(
                 f"WARN: Summary parentUuid is '{summary_parent}', "
-                f"expected '{boundary_uuid_check}'"
+                f"expected boundary UUID '{boundary_uuid_check}'"
             )
 
     # 6. First preserved message links to summary
@@ -1044,20 +786,19 @@ def verify_output(path: Path) -> None:
                     else:
                         errors.append(
                             f"WARN: First preserved message parentUuid is "
-                            f"'{obj.get('parentUuid')}', "
-                            f"expected '{summary_uuid}'"
+                            f"'{obj.get('parentUuid')}', expected '{summary_uuid}'"
                         )
                     break
 
-    # 7. Boundary parentUuid == logicalParentUuid
+    # 6. Boundary parentUuid links to a pre-boundary message
     if boundary_idx >= 0:
         _, boundary_obj = lines[boundary_idx]
-        bp = boundary_obj.get("parentUuid") if boundary_obj else None
-        lp = boundary_obj.get("logicalParentUuid") if boundary_obj else None
-        if bp and bp == lp:
+        bp_uuid = boundary_obj.get("parentUuid") if boundary_obj else None
+        lp_uuid = boundary_obj.get("logicalParentUuid") if boundary_obj else None
+        if bp_uuid and bp_uuid == lp_uuid:
             print("OK: Boundary parentUuid == logicalParentUuid")
-        elif bp:
-            errors.append(f"WARN: parentUuid != logicalParentUuid")
+        elif bp_uuid:
+            errors.append(f"WARN: parentUuid ({bp_uuid}) != logicalParentUuid ({lp_uuid})")
 
     if errors:
         for e in errors:
@@ -1072,90 +813,36 @@ def verify_output(path: Path) -> None:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Smart Compact: Context pruner for Claude Code sessions.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  # Dry run on latest session
-  %(prog)s --dry-run
-
-  # Compact with 500 preserved messages
-  %(prog)s --keep-recent 500
-
-  # Extract conversation for external summarization
-  %(prog)s --extract-conversation conversation.txt --keep-recent 500
-
-  # Compact with custom narrative summary
-  %(prog)s --keep-recent 500 --summary-file my-summary.md
-
-  # Auto-summarize via Ollama (local, free)
-  %(prog)s --auto-summarize --keep-recent 500
-
-  # Auto-summarize with a specific model
-  %(prog)s --auto-summarize --model llama3.1:8b -k 500
-
-  # Auto-summarize via remote API (OpenRouter, Anthropic, etc)
-  %(prog)s --auto-summarize --base-url https://openrouter.ai/api/v1 --api-key sk-... --model anthropic/claude-haiku -k 500
-
-  # Manual pipeline: extract -> summarize -> compact
-  %(prog)s --extract-conversation conv.txt -k 500
-  # (generate summary from conv.txt using your preferred method)
-  %(prog)s -k 500 --summary-file summary.md
-""",
+        description="Smart Compact v3: Infinite Context pruner for Claude Code sessions."
     )
     parser.add_argument(
         "session_file", nargs="?", default=None,
-        help="Path to .jsonl session file. Auto-detects if omitted.",
+        help="Path to .jsonl session file. If omitted, auto-detects the most recent session."
     )
     parser.add_argument(
         "-t", "--threshold", type=int, default=1500,
-        help="Byte threshold for slimming tool results (default: 1500)",
+        help="Byte threshold for slimming tool results in preserved section (default: 1500)"
     )
     parser.add_argument(
-        "-k", "--keep-recent", type=int, default=500,
-        help="Recent conversation messages to preserve (default: 500)",
+        "-k", "--keep-recent", type=int, default=50,
+        help="Number of recent conversation messages to preserve at full fidelity (default: 50)"
     )
     parser.add_argument(
         "--summary-file", type=str, default=None,
-        help="Path to summary text file for the compaction boundary.",
-    )
-    parser.add_argument(
-        "--extract-conversation", type=str, default=None,
-        help="Extract pre-split conversation text (stripped of tool blocks) "
-             "to this file and exit. Use to generate a narrative summary "
-             "with your preferred tool before compacting.",
+        help="Path to summary text file (e.g., soul-session-continuity.md). "
+             "If omitted, uses a generic summary."
     )
     parser.add_argument(
         "--prune-thinking", action="store_true",
-        help="Also slim large thinking blocks in preserved section.",
+        help="Also replace large thinking blocks in preserved section"
     )
     parser.add_argument(
         "--dry-run", action="store_true",
-        help="Write to .compact.jsonl instead of overwriting.",
+        help="Write to .compact-v3.jsonl instead of overwriting"
     )
     parser.add_argument(
         "--no-backup", action="store_true",
-        help="Skip creating a backup before overwriting.",
-    )
-    parser.add_argument(
-        "--auto-summarize", action="store_true",
-        help="Generate narrative summary via LLM API. "
-             "Default: Ollama locally. Use --base-url and --api-key "
-             "for remote APIs.",
-    )
-    parser.add_argument(
-        "--model", type=str, default="qwen3:8b",
-        help="Model for --auto-summarize (default: qwen3:8b via Ollama).",
-    )
-    parser.add_argument(
-        "--base-url", type=str, default="http://localhost:11434/v1",
-        help="OpenAI-compatible API base URL "
-             "(default: http://localhost:11434/v1 for Ollama).",
-    )
-    parser.add_argument(
-        "--api-key", type=str, default=None,
-        help="API key for remote endpoints. "
-             "Also reads from SMART_COMPACT_API_KEY env var.",
+        help="Skip creating a backup before overwriting"
     )
 
     args = parser.parse_args()
@@ -1165,23 +852,11 @@ Examples:
     else:
         session_path = find_latest_session()
         if session_path is None:
-            print("Error: No session files found.", file=sys.stderr)
+            print("Error: No session JSONL files found.", file=sys.stderr)
             sys.exit(1)
         print(f"Auto-detected session: {session_path}")
 
     summary_path = Path(args.summary_file) if args.summary_file else None
-    extract_path = (
-        Path(args.extract_conversation)
-        if args.extract_conversation
-        else None
-    )
-    auto_model = args.model if args.auto_summarize else None
-    api_key = args.api_key or os.environ.get("SMART_COMPACT_API_KEY")
-
-    if args.auto_summarize and args.summary_file:
-        print("Error: --auto-summarize and --summary-file are mutually "
-              "exclusive.", file=sys.stderr)
-        sys.exit(1)
 
     smart_compact(
         session_path=session_path,
@@ -1191,10 +866,6 @@ Examples:
         dry_run=args.dry_run,
         no_backup=args.no_backup,
         summary_path=summary_path,
-        extract_conversation=extract_path,
-        auto_summarize_model=auto_model,
-        auto_summarize_base_url=args.base_url,
-        auto_summarize_api_key=api_key,
     )
 
 
